@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DXF → КОМПАС-3D (v2)</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         max-width: 820px; margin: 30px auto; padding: 20px;
+         background: #f0f2f5; color: #1a1a2e; }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  .sub { color: #666; margin-bottom: 24px; }
+  .card { background: #fff; border-radius: 10px; padding: 24px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 16px; color: #333;
+             text-transform: uppercase; letter-spacing: .5px; }
+  .row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  input[type=file] { flex: 1; padding: 10px; border: 1px dashed #cbd5e1;
+                     border-radius: 8px; background: #f8fafc; }
+  label.radio { display: flex; align-items: center; gap: 6px; cursor: pointer;
+                padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 8px; }
+  label.radio:hover { background: #f8fafc; }
+  button { background: #2563eb; color: #fff; border: 0; padding: 11px 22px;
+           border-radius: 8px; cursor: pointer; font-size: 15px; font-weight: 500; }
+  button:hover { background: #1d4ed8; }
+  button:disabled { background: #93c5fd; cursor: not-allowed; }
+  button.secondary { background: #e5e7eb; color: #333; }
+  button.secondary:hover { background: #d1d5db; }
+  #log { font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+         background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 8px;
+         max-height: 360px; overflow-y: auto; white-space: pre-wrap;
+         margin-top: 16px; display: none; line-height: 1.5; }
+  #log.visible { display: block; }
+  .info { font-size: 13px; color: #555; line-height: 1.6; }
+  .badge { display: inline-block; padding: 3px 9px; border-radius: 5px;
+           font-size: 12px; font-weight: 600; }
+  .badge.green { background: #d1fae5; color: #065f46; }
+  .badge.yellow { background: #fef3c7; color: #92400e; }
+  .badge.red { background: #fee2e2; color: #991b1b; }
+</style>
+</head>
+<body>
+
+<h1>DXF → КОМПАС-3D (v2)</h1>
+<p class="sub">Конвертер R12 → R14 / 2000 / 2004 с полной структурой, совместимой с КОМПАС-3D.</p>
+
+<div class="card">
+  <h2>1. Исходный файл</h2>
+  <div class="row"><input type="file" id="fileInput" accept=".dxf,.txt"></div>
+  <div id="srcInfo" class="info" style="margin-top:12px;"></div>
+</div>
+
+<div class="card">
+  <h2>2. Целевой формат</h2>
+  <div class="row">
+    <label class="radio"><input type="radio" name="ver" value="AC1014"> R14 (AC1014)</label>
+    <label class="radio"><input type="radio" name="ver" value="AC1015" checked> 2000 (AC1015)</label>
+    <label class="radio"><input type="radio" name="ver" value="AC1018"> 2004 (AC1018)</label>
+  </div>
+  <p class="info" style="margin-top:14px;">Если файл не открывается — попробуйте другой формат. R14 обычно самый совместимый.</p>
+</div>
+
+<div class="card">
+  <h2>3. Конвертация</h2>
+  <div class="row">
+    <button id="convertBtn" disabled>Конвертировать и скачать</button>
+    <button id="logBtn" class="secondary" disabled>Показать журнал</button>
+  </div>
+  <div id="log"></div>
+</div>
+
+<script>
+/* =====================================================================
+   Утилиты
+   ===================================================================== */
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+let logVisible = false;
+
+function log(msg) { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+$('logBtn').addEventListener('click', () => {
+  logVisible = !logVisible;
+  logEl.classList.toggle('visible', logVisible);
+  $('logBtn').textContent = logVisible ? 'Скрыть журнал' : 'Показать журнал';
+});
+
+/* =====================================================================
+   Хэндлы
+   ===================================================================== */
+let handleCounter = 0x100;
+function resetHandles() { handleCounter = 0x100; }
+function nextHandle() { return (handleCounter++).toString(16).toUpperCase(); }
+
+/* =====================================================================
+   Парсер DXF
+   ===================================================================== */
+function parsePairs(text) {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const pairs = [];
+  let i = 0;
+  while (i < lines.length - 1) {
+    const code = parseInt(lines[i].trim(), 10);
+    const value = lines[i + 1];
+    if (!isNaN(code)) { pairs.push({ code, value }); i += 2; }
+    else i++;
+  }
+  return pairs;
+}
+function serializePairs(pairs) {
+  return pairs.map(p => p.code + '\n' + p.value).join('\n') + '\n';
+}
+function splitSections(pairs) {
+  const sections = [];
+  let i = 0;
+  while (i < pairs.length) {
+    const p = pairs[i];
+    if (p.code === 0 && p.value.trim() === 'SECTION') {
+      const name = pairs[i+1] && pairs[i+1].code === 2 ? pairs[i+1].value.trim() : '';
+      const body = []; i += 2;
+      while (i < pairs.length && !(pairs[i].code === 0 && pairs[i].value.trim() === 'ENDSEC')) {
+        body.push(pairs[i]); i++;
+      }
+      sections.push({ name, body });
+      if (i < pairs.length) i++;
+    } else if (p.code === 0 && p.value.trim() === 'EOF') {
+      sections.push({ name: 'EOF', body: [] }); i++;
+    } else i++;
+  }
+  return sections;
+}
+
+/* =====================================================================
+   Определение версии
+   ===================================================================== */
+const VER_NAMES = {
+  AC1009: 'AutoCAD R12', AC1012: 'AutoCAD R13', AC1014: 'AutoCAD R14',
+  AC1015: 'AutoCAD 2000', AC1018: 'AutoCAD 2004', AC1021: 'AutoCAD 2007',
+  AC1024: 'AutoCAD 2010', AC1027: 'AutoCAD 2013', AC1032: 'AutoCAD 2018',
+};
+function detectVersion(pairs) {
+  for (let i = 0; i < pairs.length - 1; i++)
+    if (pairs[i].code === 9 && pairs[i].value.trim() === '$ACADVER')
+      return pairs[i+1].value.trim();
+  return null;
+}
+
+/* =====================================================================
+   Извлечение слоёв из исходных TABLES
+   ===================================================================== */
+function extractLayers(body) {
+  const layers = [];
+  let i = 0, inLayer = false;
+  while (i < body.length) {
+    const p = body[i];
+    if (p.code === 0 && p.value.trim() === 'TABLE' && body[i+1] && body[i+1].value.trim() === 'LAYER') {
+      inLayer = true; i += 2; continue;
+    }
+    if (inLayer && p.code === 0 && p.value.trim() === 'ENDTAB') { inLayer = false; i++; continue; }
+    if (inLayer && p.code === 0 && p.value.trim() === 'LAYER') {
+      const layer = { name: '', color: '7', linetype: 'Continuous' };
+      let j = i + 1;
+      while (j < body.length && body[j].code !== 0) {
+        if (body[j].code === 2) layer.name = body[j].value.trim();
+        if (body[j].code === 62) layer.color = body[j].value.trim();
+        if (body[j].code === 6) layer.linetype = body[j].value.trim() || 'Continuous';
+        j++;
+      }
+      if (layer.name) layers.push(layer);
+      i = j; continue;
+    }
+    i++;
+  }
+  return layers;
+}
+
+/* =====================================================================
+   HEADER
+   ===================================================================== */
+function buildHeader(origBody, targetVer) {
+  const out = [];
+  const seen = new Set();
+
+  // Копируем существующие переменные
+  if (origBody) {
+    let i = 0;
+    while (i < origBody.length) {
+      const p = origBody[i];
+      if (p.code === 9) {
+        const name = p.value.trim();
+        const pairs = [];
+        let j = i + 1;
+        while (j < origBody.length && origBody[j].code !== 9) { pairs.push(origBody[j]); j++; }
+        if (name === '$ACADVER') {
+          out.push({ code: 9, value: '$ACADVER' }, { code: 1, value: targetVer });
+        } else if (name === '$HANDSEED') {
+          // отложим — установим в самом конце
+          out.push({ code: 9, value: '$HANDSEED' }, { code: 5, value: 'FFFF' });
+        } else {
+          out.push(p, ...pairs);
+        }
+        seen.add(name);
+        i = j;
+      } else i++;
+    }
+  }
+
+  const ensure = (name, pairs) => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    out.push({ code: 9, value: name });
+    for (const [c, v] of pairs) out.push({ code: c, value: v });
+  };
+
+  ensure('$ACADVER',     [[1, targetVer]]);
+  ensure('$HANDSEED',    [[5, 'FFFF']]);
+  ensure('$INSUNITS',    [[70, '4']]);
+  ensure('$MEASUREMENT', [[70, '1']]);
+  ensure('$INSBASE',     [[10, '0.0'], [20, '0.0'], [30, '0.0']]);
+  ensure('$EXTMIN',      [[10, '0.0'], [20, '0.0'], [30, '0.0']]);
+  ensure('$EXTMAX',      [[10, '420.0'], [20, '297.0'], [30, '0.0']]);
+  ensure('$LIMMIN',      [[10, '0.0'], [20, '0.0']]);
+  ensure('$LIMMAX',      [[10, '420.0'], [20, '297.0']]);
+  ensure('$LTSCALE',     [[40, '1.0']]);
+  ensure('$TEXTSIZE',    [[40, '2.5']]);
+  ensure('$DIMSCALE',    [[40, '1.0']]);
+  ensure('$CELTYPE',     [[6,  'ByLayer']]);
+  ensure('$CLAYER',      [[8,  '0']]);
+  ensure('$CECOLOR',     [[62, '256']]);
+
+  return out;
+}
+
+/* =====================================================================
+   Построение TABLES
+   ===================================================================== */
+function buildTables(H, layers, modern) {
+  const out = [];
+
+  const tableHeader = (name, handle) => {
+    out.push({ code: 0, value: 'TABLE' });
+    out.push({ code: 2, value: name });
+    out.push({ code: 5, value: handle });
+    if (modern) {
+      out.push({ code: 330, value: '0' });
+      out.push({ code: 100, value: 'AcDbSymbolTable' });
+    }
+  };
+  const tableEnd = () => out.push({ code: 0, value: 'ENDTAB' });
+
+  const commonRec = (handle, tableHandle, subclass) => {
+    out.push({ code: 5, value: handle });
+    if (modern) {
+      out.push({ code: 330, value: tableHandle });
+      out.push({ code: 100, value: 'AcDbSymbolTableRecord' });
+      out.push({ code: 100, value: subclass });
+    }
+  };
+
+  /* ---- VPORT ---- */
+  tableHeader('VPORT', H.VPORT_TABLE);
+  out.push({ code: 70, value: '1' });
+  out.push({ code: 0, value: 'VPORT' });
+  commonRec(H.VPORT_ACTIVE, H.VPORT_TABLE, 'AcDbViewportTableRecord');
+  out.push(
+    { code: 2, value: '*ACTIVE' }, { code: 70, value: '0' },
+    { code: 10, value: '0.0' }, { code: 20, value: '0.0' },
+    { code: 11, value: '1.0' }, { code: 21, value: '1.0' },
+    { code: 12, value: '210.0' }, { code: 22, value: '148.5' },
+    { code: 13, value: '0.0' }, { code: 23, value: '0.0' },
+    { code: 14, value: '10.0' }, { code: 24, value: '10.0' },
+    { code: 15, value: '10.0' }, { code: 25, value: '10.0' },
+    { code: 16, value: '0.0' }, { code: 26, value: '0.0' }, { code: 36, value: '1.0' },
+    { code: 17, value: '0.0' }, { code: 27, value: '0.0' }, { code: 37, value: '0.0' },
+    { code: 40, value: '297.0' }, { code: 41, value: '1.414' },
+    { code: 42, value: '50.0' }, { code: 43, value: '0.0' }, { code: 44, value: '0.0' },
+    { code: 50, value: '0.0' }, { code: 51, value: '0.0' },
+    { code: 71, value: '0' }, { code: 72, value: '100' },
+    { code: 73, value: '1' }, { code: 74, value: '3' },
+    { code: 75, value: '0' }, { code: 76, value: '0' },
+    { code: 77, value: '0' }, { code: 78, value: '0' }
+  );
+  tableEnd();
+
+  /* ---- LTYPE (обязательно ByBlock, ByLayer, Continuous) ---- */
+  tableHeader('LTYPE', H.LTYPE_TABLE);
+  out.push({ code: 70, value: '3' });
+  const ltype = (h, name, desc) => {
+    out.push({ code: 0, value: 'LTYPE' });
+    commonRec(h, H.LTYPE_TABLE, 'AcDbLinetypeTableRecord');
+    out.push(
+      { code: 2, value: name }, { code: 70, value: '0' },
+      { code: 3, value: desc }, { code: 72, value: '65' },
+      { code: 73, value: '0' }, { code: 40, value: '0.0' }
+    );
+  };
+  ltype(H.LTYPE_BYBLOCK, 'ByBlock', '');
+  ltype(H.LTYPE_BYLAYER, 'ByLayer', '');
+  ltype(H.LTYPE_CONTINUOUS, 'Continuous', 'Solid line');
+  tableEnd();
+
+  /* ---- LAYER ---- */
+  tableHeader('LAYER', H.LAYER_TABLE);
+  const extraLayers = layers.filter(l => l.name && l.name !== '0');
+  out.push({ code: 70, value: String(1 + extraLayers.length) });
+  const layer = (h, name, color, ltype) => {
+    out.push({ code: 0, value: 'LAYER' });
+    commonRec(h, H.LAYER_TABLE, 'AcDbLayerTableRecord');
+    out.push(
+      { code: 2, value: name }, { code: 70, value: '0' },
+      { code: 62, value: String(color) },
+      { code: 6, value: ltype || 'Continuous' }
+    );
+  };
+  layer(H.LAYER_0, '0', 7, 'Continuous');
+  for (const l of extraLayers) {
+    const h = H['LAYER_' + l.name] || nextHandle();
+    layer(h, l.name, l.color, l.linetype);
+  }
+  tableEnd();
+
+  /* ---- STYLE ---- */
+  tableHeader('STYLE', H.STYLE_TABLE);
+  out.push({ code: 70, value: '1' });
+  out.push({ code: 0, value: 'STYLE' });
+  commonRec(H.STYLE_STANDARD, H.STYLE_TABLE, 'AcDbTextStyleTableRecord');
+  out.push(
+    { code: 2, value: 'Standard' }, { code: 70, value: '0' },
+    { code: 40, value: '0.0' }, { code: 41, value: '1.0' },
+    { code: 50, value: '0.0' }, { code: 71, value: '0' },
+    { code: 42, value: '2.5' }, { code: 3, value: 'txt' },
+    { code: 4, value: '' }
+  );
+  tableEnd();
+
+  /* ---- VIEW (пустая) ---- */
+  tableHeader('VIEW', H.VIEW_TABLE);
+  out.push({ code: 70, value: '0' });
+  tableEnd();
+
+  /* ---- UCS (пустая) ---- */
+  tableHeader('UCS', H.UCS_TABLE);
+  out.push({ code: 70, value: '0' });
+  tableEnd();
+
+  /* ---- APPID ---- */
+  tableHeader('APPID', H.APPID_TABLE);
+  out.push({ code: 70, value: '1' });
+  out.push({ code: 0, value: 'APPID' });
+  commonRec(H.APPID_ACAD, H.APPID_TABLE, 'AcDbRegAppTableRecord');
+  out.push({ code: 2, value: 'ACAD' }, { code: 70, value: '0' });
+  tableEnd();
+
+  /* ---- DIMSTYLE (код 105 вместо 5!) ---- */
+  tableHeader('DIMSTYLE', H.DIMSTYLE_TABLE);
+  out.push({ code: 100, value: 'AcDbDimStyleTable' });
+  out.push({ code: 70, value: '1' });
+  out.push({ code: 0, value: 'DIMSTYLE' });
+  out.push({ code: 105, value: H.DIMSTYLE_STANDARD });
+  if (modern) {
+    out.push({ code: 330, value: H.DIMSTYLE_TABLE });
+    out.push({ code: 100, value: 'AcDbSymbolTableRecord' });
+    out.push({ code: 100, value: 'AcDbDimStyleTableRecord' });
+  }
+  out.push({ code: 2, value: 'Standard' }, { code: 70, value: '0' });
+  tableEnd();
+
+  /* ---- BLOCK_RECORD ---- */
+  tableHeader('BLOCK_RECORD', H.BLOCK_RECORD_TABLE);
+  out.push({ code: 70, value: '2' });
+  const br = (h, name) => {
+    out.push({ code: 0, value: 'BLOCK_RECORD' });
+    commonRec(h, H.BLOCK_RECORD_TABLE, 'AcDbBlockTableRecord');
+    out.push({ code: 2, value: name }, { code: 70, value: '0' });
+  };
+  br(H.BR_MODEL, '*Model_Space');
+  br(H.BR_PAPER, '*Paper_Space');
+  tableEnd();
+
+  return out;
+}
+
+/* =====================================================================
+   Построение BLOCKS (*Model_Space, *Paper_Space)
+   ===================================================================== */
+function buildBlocks(H, modern) {
+  const out = [];
+  const makeBlock = (name, blockHandle, endHandle, brHandle, isPaper) => {
+    out.push({ code: 0, value: 'BLOCK' });
+    out.push({ code: 5, value: blockHandle });
+    if (modern) {
+      out.push({ code: 330, value: brHandle });
+      out.push({ code: 100, value: 'AcDbEntity' });
+    }
+    out.push({ code: 8, value: '0' });
+    if (modern) out.push({ code: 100, value: 'AcDbBlockBegin' });
+    out.push(
+      { code: 2, value: name }, { code: 70, value: '0' },
+      { code: 10, value: '0.0' }, { code: 20, value: '0.0' }, { code: 30, value: '0.0' },
+      { code: 3, value: name }, { code: 1, value: '' }
+    );
+    out.push({ code: 0, value: 'ENDBLK' });
+    out.push({ code: 5, value: endHandle });
+    if (modern) {
+      out.push({ code: 330, value: brHandle });
+      out.push({ code: 100, value: 'AcDbEntity' });
+    }
+    out.push({ code: 8, value: '0' });
+    if (modern) out.push({ code: 100, value: 'AcDbBlockEnd' });
+  };
+  makeBlock('*Model_Space', H.BLOCK_MODEL, H.BLOCK_MODEL_END, H.BR_MODEL, false);
+  makeBlock('*Paper_Space', H.BLOCK_PAPER, H.BLOCK_PAPER_END, H.BR_PAPER, true);
+  return out;
+}
+
+/* =====================================================================
+   ENTITIES: добавляем handle (5), owner (330) и subclass (100)
+   ===================================================================== */
+const ENTITY_SUBCLASS = {
+  'LINE': ['AcDbLine'],
+  'CIRCLE': ['AcDbCircle'],
+  'ARC': ['AcDbCircle', 'AcDbArc'],
+  'TEXT': ['AcDbText'],
+  'MTEXT': ['AcDbMText'],
+  'POINT': ['AcDbPoint'],
+  'LWPOLYLINE': ['AcDbPolyline'],
+  'POLYLINE': ['AcDb2dPolyline'],
+  'VERTEX': ['AcDbVertex', 'AcDb2dVertex'],
+  'SEQEND': [],
+  'INSERT': ['AcDbBlockReference'],
+  'SOLID': ['AcDbTrace'],
+  'TRACE': ['AcDbTrace'],
+  '3DFACE': ['AcDbFace'],
+  'ELLIPSE': ['AcDbEllipse'],
+  'SPLINE': ['AcDbSpline'],
+  'DIMENSION': ['AcDbDimension'],
+  'LEADER': ['AcDbLeader'],
+  'HATCH': ['AcDbHatch'],
+  'ATTDEF': ['AcDbText', 'AcDbAttributeDefinition'],
+  'ATTRIB': ['AcDbText', 'AcDbAttribute'],
+  'SHAPE': ['AcDbShape'],
+  'VIEWPORT': ['AcDbViewport'],
+  'MLINE': ['AcDbMline'],
+  'RAY': ['AcDbRay'],
+  'XLINE': ['AcDbXline'],
+};
+
+function buildEntities(origBody, ownerHandle, modern) {
+  const out = [];
+  if (!origBody) return out;
+  let i = 0;
+  while (i < origBody.length) {
+    const p = origBody[i];
+    if (p.code === 0) {
+      const type = p.value.trim();
+      i++;
+      const attrs = [];
+      while (i < origBody.length && origBody[i].code !== 0) { attrs.push(origBody[i]); i++; }
+
+      out.push({ code: 0, value: type });
+
+      // handle
+      let handle = null;
+      const cleaned = [];
+      for (const a of attrs) {
+        if (a.code === 5) { handle = a.value; continue; }
+        if (a.code === 330) continue;
+        if (a.code === 100) continue;
+        cleaned.push(a);
+      }
+      if (!handle) handle = nextHandle();
+      out.push({ code: 5, value: handle });
+
+      // owner
+      if (modern) out.push({ code: 330, value: ownerHandle });
+
+      // subclass markers: AcDbEntity + AcDb<Type> вставляем перед кодом 8 (слой)
+      const subs = ['AcDbEntity', ...(ENTITY_SUBCLASS[type] || [])];
+      let inserted = false;
+      for (const a of cleaned) {
+        if (!inserted && a.code === 8) {
+          if (modern) for (const s of subs) out.push({ code: 100, value: s });
+          inserted = true;
+        }
+        out.push(a);
+      }
+      if (!inserted && modern) for (const s of subs) out.push({ code: 100, value: s });
+    } else {
+      i++;
+    }
+  }
+  return out;
+}
+
+/* =====================================================================
+   OBJECTS (корневой словарь + ACAD_GROUP)
+   ===================================================================== */
+function buildObjects(H, modern) {
+  if (!modern) return [];
+  return [
+    { code: 0, value: 'DICTIONARY' },
+    { code: 5, value: H.ROOT_DICT },
+    { code: 330, value: '0' },
+    { code: 100, value: 'AcDbDictionary' },
+    { code: 281, value: '1' },
+    { code: 3, value: 'ACAD_GROUP' },
+    { code: 350, value: H.GROUP_DICT },
+    { code: 0, value: 'DICTIONARY' },
+    { code: 5, value: H.GROUP_DICT },
+    { code: 330, value: H.ROOT_DICT },
+    { code: 100, value: 'AcDbDictionary' },
+    { code: 281, value: '1' },
+  ];
+}
+
+/* =====================================================================
+   Главная функция
+   ===================================================================== */
+function convertDXF(text, targetVer) {
+  resetHandles();
+  logEl.textContent = '';
+  log('--- Конвертация ---');
+  const pairs = parsePairs(text);
+  log('Пар (код/значение): ' + pairs.length);
+
+  const srcVer = detectVersion(pairs);
+  log('Исходная версия: ' + (srcVer ? srcVer + ' (' + (VER_NAMES[srcVer] || '?') + ')' : 'не определена (R12?)'));
+  log('Целевая версия:  ' + targetVer + ' (' + (VER_NAMES[targetVer] || '?') + ')');
+
+  const sections = splitSections(pairs);
+  log('Секции: ' + sections.map(s => s.name).join(', '));
+
+  // Для R14+ (все наши цели) нужны subclass-маркеры и owner
+  const modern = true;
+
+  // Извлекаем слои
+  const origTables = sections.find(s => s.name === 'TABLES');
+  const layers = origTables ? extractLayers(origTables.body) : [];
+  log('Слоёв найдено: ' + (1 + layers.filter(l => l.name !== '0').length));
+
+  // Резервируем структурные хэндлы
+  const H = {};
+  const R = (name) => { H[name] = nextHandle(); return H[name]; };
+  R('VPORT_TABLE'); R('VPORT_ACTIVE');
+  R('LTYPE_TABLE'); R('LTYPE_BYBLOCK'); R('LTYPE_BYLAYER'); R('LTYPE_CONTINUOUS');
+  R('LAYER_TABLE'); R('LAYER_0');
+  for (const l of layers) if (l.name && l.name !== '0') H['LAYER_' + l.name] = nextHandle();
+  R('STYLE_TABLE'); R('STYLE_STANDARD');
+  R('VIEW_TABLE');
+  R('UCS_TABLE');
+  R('APPID_TABLE'); R('APPID_ACAD');
+  R('DIMSTYLE_TABLE'); R('DIMSTYLE_STANDARD');
+  R('BLOCK_RECORD_TABLE'); R('BR_MODEL'); R('BR_PAPER');
+  R('BLOCK_MODEL'); R('BLOCK_MODEL_END');
+  R('BLOCK_PAPER'); R('BLOCK_PAPER_END');
+  R('ROOT_DICT'); R('GROUP_DICT');
+
+  // Собираем результат
+  const result = [];
+  const pushSection = (name, body) => {
+    result.push({ code: 0, value: 'SECTION' });
+    result.push({ code: 2, value: name });
+    result.push(...body);
+    result.push({ code: 0, value: 'ENDSEC' });
+  };
+
+  // HEADER
+  const origHeader = sections.find(s => s.name === 'HEADER');
+  pushSection('HEADER', buildHeader(origHeader ? origHeader.body : null, targetVer));
+  // CLASSES (обязательна, пустая)
+  pushSection('CLASSES', []);
+  // TABLES
+  pushSection('TABLES', buildTables(H, layers, modern));
+  // BLOCKS
+  pushSection('BLOCKS', buildBlocks(H, modern));
+  // ENTITIES
+  const origEnt = sections.find(s => s.name === 'ENTITIES');
+  pushSection('ENTITIES', buildEntities(origEnt ? origEnt.body : [], H.BR_MODEL, modern));
+  // OBJECTS
+  pushSection('OBJECTS', buildObjects(H, modern));
+
+  // EOF
+  result.push({ code: 0, value: 'EOF' });
+
+  // Обновляем $HANDSEED
+  const seed = (handleCounter + 0x100).toString(16).toUpperCase();
+  for (let i = 0; i < result.length - 1; i++) {
+    if (result[i].code === 9 && result[i].value.trim() === '$HANDSEED') {
+      result[i+1].value = seed; break;
+    }
+  }
+  log('Использовано хэндлов: ' + (handleCounter - 0x100));
+  log('$HANDSEED = ' + seed);
+  log('--- Готово ---');
+
+  return serializePairs(result);
+}
+
+/* =====================================================================
+   UI
+   ===================================================================== */
+let currentFile = null;
+
+$('fileInput').addEventListener('change', async (e) => {
+  currentFile = e.target.files[0];
+  if (!currentFile) return;
+  const text = await currentFile.text();
+  const pairs = parsePairs(text);
+  const ver = detectVersion(pairs);
+  const badge = ver
+    ? `<span class="badge ${ver === 'AC1009' ? 'red' : 'green'}">${ver} — ${VER_NAMES[ver] || '?'}</span>`
+    : `<span class="badge yellow">$ACADVER отсутствует — вероятно R12 (AC1009)</span>`;
+  $('srcInfo').innerHTML =
+    `Файл: <strong>${currentFile.name}</strong> — ${(currentFile.size/1024).toFixed(1)} КБ<br>Версия: ${badge}`;
+  $('convertBtn').disabled = false;
+  $('logBtn').disabled = false;
+  logEl.textContent = '';
+  logEl.classList.remove('visible');
+  logVisible = false;
+  $('logBtn').textContent = 'Показать журнал';
+});
+
+$('convertBtn').addEventListener('click', async () => {
+  if (!currentFile) return;
+  const targetVer = document.querySelector('input[name="ver"]:checked').value;
+  const text = await currentFile.text();
+  try {
+    const outText = convertDXF(text, targetVer);
+    const base = currentFile.name.replace(/\.(dxf|txt)$/i, '');
+    const outName = base + '_' + targetVer + '.dxf';
+    const blob = new Blob([outText], { type: 'application/dxf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = outName;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    log('Скачан: ' + outName);
+    // автооткрытие журнала
+    if (!logVisible) { logEl.classList.add('visible'); logVisible = true; $('logBtn').textContent = 'Скрыть журнал'; }
+  } catch (err) {
+    log('ОШИБКА: ' + err.message);
+    console.error(err);
+  }
+});
+</script>
+</body>
+</html>
